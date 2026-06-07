@@ -205,13 +205,13 @@ class ToolboxApp(App):
         area = self.query_one("#content-area", Vertical)
         area.remove_children()
 
-        area.mount(Static(f"[b]{tool.title}[/b] — {tool.summary}", id="tool-summary"))
-        area.mount(Static(f"Đường dẫn: [dim]{tool.command_path}[/dim]", id="tool-path"))
-        area.mount(Static("Ví dụ sử dụng:", id="examples-label"))
+        area.mount(Static(f"[b]{tool.title}[/b] — {tool.summary}"))
+        area.mount(Static(f"Đường dẫn: [dim]{tool.command_path}[/dim]"))
+        area.mount(Static("Ví dụ sử dụng:"))
         for i, ex in enumerate(tool.examples):
-            area.mount(Static(f"  [cyan]$[/cyan] {ex}", id=f"example-item-{i}"))
-        area.mount(Static("Nội dung --help:", id="help-label"))
-        area.mount(Static(help_text, id="help-content", markup=False))
+            area.mount(Static(f"  [cyan]$[/cyan] {ex}"))
+        area.mount(Static("Nội dung --help:"))
+        area.mount(Static(help_text, markup=False))
 
     def action_select_next(self) -> None:
         self.select_tool((self.selected_index + 1) % len(TOOLS))
