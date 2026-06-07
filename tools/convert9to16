@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SCRIPT_NAME="$(basename "$0")"
+
+usage() {
+  cat <<EOF
+Sử dụng:
+  $SCRIPT_NAME IMAGE_DIR [--hexcolor HEX]
+
+Ví dụ:
+  $SCRIPT_NAME /duong/dan/thu-muc-anh
+  $SCRIPT_NAME /duong/dan/thu-muc-anh --hexcolor '#ff0000'
+  $SCRIPT_NAME /duong/dan/thu-muc-anh --hexcolor 222222
+
+Mô tả:
+  Convert toàn bộ ảnh nằm trực tiếp trong IMAGE_DIR sang khung 16:9.
+  Ảnh gốc được giữ ở giữa, phần trống hai bên hoặc trên dưới được đổ nền.
+  File sau convert được ghi vào thư mục IMAGE_DIR/output.
+
+Tùy chọn:
+  --hexcolor HEX    Màu nền dạng mã hex RGB/RRGGBB. Mặc định: #000000
+  -h, --help        Hiển thị hướng dẫn này.
+
+Định dạng ảnh hỗ trợ:
+  jpg, jpeg, png, webp, bmp, tif, tiff, heic, heif
+EOF
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+normalize_hex_color() {
+  local color="$1"
+
+  color="${color#\#}"
+  if [[ ! "$color" =~ ^[0-9A-Fa-f]{3}([0-9A-Fa-f]{3})?$ ]]; then
+    die "Invalid hex color '$1'. Use RGB/RRGGBB, for example: --hexcolor '#111111'"
+  fi
+
+  printf '#%s\n' "$color"
+}
+
+image_size() {
+  local input="$1"
+  magick identify -format '%w %h' "$input" 2>/dev/null || die "Cannot read image size from '$input'"
+}
+
+convert_one() {
+  local input="$1"
+  local output="$2"
+  local bg="$3"
+  local size width height target_width target_height
+
+  size="$(image_size "$input")"
+  read -r width height <<< "$size"
+
+  [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || die "Invalid image dimensions for '$input': ${width}x${height}"
+
+  if (( width * 9 > height * 16 )); then
+    target_width="$width"
+    target_height=$(((width * 9 + 15) / 16))
+  else
+    target_height="$height"
+    target_width=$(((height * 16 + 8) / 9))
+  fi
+
+  magick "$input" \
+    -background "$bg" \
+    -gravity center \
+    -extent "${target_width}x${target_height}" \
+    "$output"
+}
+
+is_supported_image() {
+  local filename="$1"
+  local lower="${filename,,}"
+
+  case "$lower" in
+    *.jpg|*.jpeg|*.png|*.webp|*.bmp|*.tif|*.tiff|*.heic|*.heif)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  local input_dir=''
+  local output_dir=''
+  local bg='#000000'
+
+  while (($#)); do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --hexcolor)
+        (($# >= 2)) || die "--hexcolor requires a value"
+        bg="$(normalize_hex_color "$2")"
+        shift 2
+        ;;
+      --hexcolor=*)
+        bg="$(normalize_hex_color "${1#*=}")"
+        shift
+        ;;
+      --)
+        shift
+        while (($#)); do
+          if [[ -z "$input_dir" ]]; then
+            input_dir="$1"
+          else
+            die "Unexpected argument '$1'"
+          fi
+          shift
+        done
+        ;;
+      -*)
+        die "Unknown option '$1'"
+        ;;
+      *)
+        if [[ -z "$input_dir" ]]; then
+          input_dir="$1"
+        else
+          die "Unexpected argument '$1'"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$input_dir" ]] || die "Missing input directory. Run: $SCRIPT_NAME --help"
+  [[ -d "$input_dir" ]] || die "Input path is not a directory: $input_dir"
+  [[ -r "$input_dir" ]] || die "Input directory is not readable: $input_dir"
+
+  has_command magick || die "ImageMagick is required. On CachyOS/Arch: sudo pacman -S imagemagick"
+
+  output_dir="${input_dir%/}/output"
+  mkdir -p -- "$output_dir"
+
+  local file base converted=0 skipped=0
+  while IFS= read -r -d '' file; do
+    base="$(basename -- "$file")"
+
+    if is_supported_image "$base"; then
+      convert_one "$file" "$output_dir/$base" "$bg"
+      printf 'Created: %s\n' "$output_dir/$base"
+      converted=$((converted + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done < <(find "$input_dir" -maxdepth 1 -type f -print0 | sort -z)
+
+  ((converted > 0)) || die "No supported images found in '$input_dir'"
+
+  printf 'Done: %s image(s), output: %s, background: %s\n' "$converted" "$output_dir" "$bg"
+  if ((skipped > 0)); then
+    printf 'Skipped: %s unsupported file(s)\n' "$skipped"
+  fi
+}
+
+main "$@"

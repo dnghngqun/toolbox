@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+APP_NAME = "convertPdf"
+WINDOW_TITLE = "convertPdf"
+OUTPUT_DIR_NAME = "pdf-output"
+
+
+def find_docx_files(folder: Path) -> list[Path]:
+    return sorted(
+        [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() == ".docx"
+        ],
+        key=lambda path: path.name.casefold(),
+    )
+
+
+def pick_initial_folder(raw_paths: list[str]) -> Path | None:
+    for raw_path in raw_paths:
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_dir():
+            return candidate.resolve()
+        if candidate.is_file():
+            return candidate.resolve().parent
+
+    current_dir = Path.cwd().resolve()
+    if find_docx_files(current_dir):
+        return current_dir
+    return None
+
+
+def uri_to_path(uri: str) -> Path | None:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    if parsed.netloc not in ("", "localhost"):
+        return None
+    return Path(unquote(parsed.path))
+
+
+def convert_folder(folder: Path) -> dict:
+    folder = folder.resolve()
+    if not folder.is_dir():
+        return {
+            "ok": False,
+            "error": f"Thu muc khong ton tai: {folder}",
+            "source_files": [],
+            "created_files": [],
+            "missing_sources": [],
+            "output_dir": folder / OUTPUT_DIR_NAME,
+            "stdout": "",
+            "stderr": "",
+            "returncode": 1,
+        }
+
+    source_files = find_docx_files(folder)
+    output_dir = folder / OUTPUT_DIR_NAME
+
+    if not source_files:
+        return {
+            "ok": False,
+            "error": f"Khong tim thay file DOCX nao trong: {folder}",
+            "source_files": [],
+            "created_files": [],
+            "missing_sources": [],
+            "output_dir": output_dir,
+            "stdout": "",
+            "stderr": "",
+            "returncode": 1,
+        }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    runtime_root = Path(tempfile.gettempdir()) / APP_NAME
+    cache_dir = runtime_root / "cache"
+    home_dir = runtime_root / "home"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    home_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = Path(tempfile.mkdtemp(prefix="libreoffice-profile-", dir=runtime_root))
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    env["SAL_USE_VCLPLUGIN"] = "svp"
+
+    command = [
+        "libreoffice",
+        f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+        "--headless",
+        "--nologo",
+        "--nodefault",
+        "--nolockcheck",
+        "--nofirststartwizard",
+        "--convert-to",
+        "pdf:writer_pdf_Export",
+        "--outdir",
+        str(output_dir),
+        *[str(path) for path in source_files],
+    ]
+
+    stdout = ""
+    stderr = ""
+    returncode = 1
+
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env=env,
+        )
+        stdout = completed.stdout
+        stderr = completed.stderr
+        returncode = completed.returncode
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "Khong tim thay libreoffice trong PATH.",
+            "source_files": source_files,
+            "created_files": [],
+            "missing_sources": source_files,
+            "output_dir": output_dir,
+            "stdout": "",
+            "stderr": "",
+            "returncode": 127,
+        }
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        returncode = 124
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    created_files = []
+    missing_sources = []
+    for source_file in source_files:
+        pdf_path = output_dir / f"{source_file.stem}.pdf"
+        if pdf_path.exists():
+            created_files.append(pdf_path)
+        else:
+            missing_sources.append(source_file)
+
+    ok = returncode == 0 and not missing_sources
+    error = ""
+    if returncode == 124:
+        error = "LibreOffice bi timeout trong qua trinh convert."
+    elif returncode != 0:
+        error = f"LibreOffice tra ve ma loi {returncode}."
+
+    return {
+        "ok": ok,
+        "error": error,
+        "source_files": source_files,
+        "created_files": created_files,
+        "missing_sources": missing_sources,
+        "output_dir": output_dir,
+        "stdout": stdout,
+        "stderr": stderr,
+        "returncode": returncode,
+    }
+
+
+def run_batch(folder: Path) -> int:
+    result = convert_folder(folder)
+    print(f"Thu muc nguon: {folder.resolve()}")
+    print(f"Thu muc output: {result['output_dir']}")
+
+    if result["error"]:
+        print(result["error"], file=sys.stderr)
+
+    for created_file in result["created_files"]:
+        print(f"OK   {created_file.name}")
+
+    for missing_source in result["missing_sources"]:
+        print(f"FAIL {missing_source.name}", file=sys.stderr)
+
+    stdout = result["stdout"].strip()
+    stderr = result["stderr"].strip()
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr, file=sys.stderr)
+
+    return 0 if result["ok"] else 1
+
+
+def run_gui(initial_folder: Path | None) -> int:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    class ConvertPdfWindow(Gtk.Window):
+        def __init__(self, selected_folder: Path | None) -> None:
+            super().__init__(title=WINDOW_TITLE)
+            self.selected_folder = None
+            self.output_folder = None
+            self.converting = False
+
+            self.set_border_width(18)
+            self.set_default_size(760, 560)
+            self.set_position(Gtk.WindowPosition.CENTER)
+
+            self._apply_css()
+            self._build_ui()
+            self._setup_drag_and_drop()
+
+            if selected_folder:
+                self.set_selected_folder(selected_folder)
+            else:
+                self._update_folder_ui()
+
+        def _apply_css(self) -> None:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(
+                b"""
+                #drop-zone {
+                    background: #f3f6fb;
+                    border: 2px dashed #47678f;
+                    border-radius: 14px;
+                }
+                #drop-zone.drag-hover {
+                    background: #e6efff;
+                }
+                #drop-title {
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+                #path-value {
+                    font-family: monospace;
+                }
+                """
+            )
+            screen = Gdk.Screen.get_default()
+            if screen is not None:
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen,
+                    provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+                )
+
+        def _build_ui(self) -> None:
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            self.add(root)
+
+            title = Gtk.Label()
+            title.set_xalign(0)
+            title.set_markup("<span size='18000' weight='bold'>convertPdf</span>")
+            root.pack_start(title, False, False, 0)
+
+            subtitle = Gtk.Label()
+            subtitle.set_xalign(0)
+            subtitle.set_line_wrap(True)
+            subtitle.set_text(
+                "Tha thu muc chua DOCX vao vung ben duoi hoac bam Chon thu muc. "
+                "App se convert toan bo file .docx nam truc tiep trong thu muc da chon."
+            )
+            root.pack_start(subtitle, False, False, 0)
+
+            self.drop_zone = Gtk.EventBox()
+            self.drop_zone.set_name("drop-zone")
+            drop_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            drop_content.set_border_width(28)
+
+            drop_title = Gtk.Label(label="Tha thu muc vao day")
+            drop_title.set_name("drop-title")
+            drop_title.set_xalign(0.5)
+            drop_content.pack_start(drop_title, False, False, 0)
+
+            drop_hint = Gtk.Label(
+                label="Ban cung co the tha file DOCX; app se tu lay thu muc cha cua file do."
+            )
+            drop_hint.set_line_wrap(True)
+            drop_hint.set_justify(Gtk.Justification.CENTER)
+            drop_content.pack_start(drop_hint, False, False, 0)
+
+            self.drop_zone.add(drop_content)
+            root.pack_start(self.drop_zone, False, False, 0)
+
+            folder_heading = Gtk.Label(label="Thu muc da chon")
+            folder_heading.set_xalign(0)
+            root.pack_start(folder_heading, False, False, 0)
+
+            self.path_value = Gtk.Label()
+            self.path_value.set_name("path-value")
+            self.path_value.set_xalign(0)
+            self.path_value.set_line_wrap(True)
+            self.path_value.set_selectable(True)
+            root.pack_start(self.path_value, False, False, 0)
+
+            self.folder_summary = Gtk.Label()
+            self.folder_summary.set_xalign(0)
+            self.folder_summary.set_line_wrap(True)
+            root.pack_start(self.folder_summary, False, False, 0)
+
+            button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            root.pack_start(button_row, False, False, 0)
+
+            self.choose_button = Gtk.Button(label="Chon thu muc")
+            self.choose_button.connect("clicked", self.on_choose_folder_clicked)
+            button_row.pack_start(self.choose_button, False, False, 0)
+
+            self.convert_button = Gtk.Button(label="Convert sang PDF")
+            self.convert_button.connect("clicked", self.on_convert_clicked)
+            button_row.pack_start(self.convert_button, False, False, 0)
+
+            self.open_output_button = Gtk.Button(label="Mo thu muc output")
+            self.open_output_button.connect("clicked", self.on_open_output_clicked)
+            button_row.pack_start(self.open_output_button, False, False, 0)
+
+            self.status_label = Gtk.Label()
+            self.status_label.set_xalign(0)
+            root.pack_start(self.status_label, False, False, 0)
+
+            log_heading = Gtk.Label(label="Log")
+            log_heading.set_xalign(0)
+            root.pack_start(log_heading, False, False, 0)
+
+            self.log_view = Gtk.TextView()
+            self.log_view.set_editable(False)
+            self.log_view.set_cursor_visible(False)
+            self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.log_view.set_monospace(True)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_hexpand(True)
+            scroller.set_vexpand(True)
+            scroller.add(self.log_view)
+            root.pack_start(scroller, True, True, 0)
+
+        def _setup_drag_and_drop(self) -> None:
+            for target_widget in (self, self.drop_zone):
+                target_widget.drag_dest_set(
+                    Gtk.DestDefaults.ALL,
+                    [],
+                    Gdk.DragAction.COPY,
+                )
+                target_widget.drag_dest_add_uri_targets()
+                target_widget.connect("drag-motion", self.on_drag_motion)
+                target_widget.connect("drag-leave", self.on_drag_leave)
+                target_widget.connect("drag-data-received", self.on_drag_data_received)
+
+        def append_log(self, message: str) -> None:
+            text_buffer = self.log_view.get_buffer()
+            end_iter = text_buffer.get_end_iter()
+            text_buffer.insert(end_iter, f"{message}\n")
+            end_iter = text_buffer.get_end_iter()
+            self.log_view.scroll_to_iter(end_iter, 0.0, False, 0.0, 1.0)
+
+        def set_status(self, message: str) -> None:
+            self.status_label.set_text(message)
+
+        def set_selected_folder(self, folder: Path) -> None:
+            self.selected_folder = folder.resolve()
+            self.output_folder = self.selected_folder / OUTPUT_DIR_NAME
+            self.append_log(f"Da chon thu muc: {self.selected_folder}")
+            self._update_folder_ui()
+
+        def _update_folder_ui(self, keep_status: bool = False) -> None:
+            if self.selected_folder is None:
+                self.path_value.set_text("Chua co thu muc nao duoc chon.")
+                self.folder_summary.set_text("Tha mot thu muc vao app de bat dau.")
+                self.convert_button.set_sensitive(False)
+                self.open_output_button.set_sensitive(False)
+                if not keep_status:
+                    self.set_status("San sang.")
+                return
+
+            docx_files = find_docx_files(self.selected_folder)
+            self.path_value.set_text(str(self.selected_folder))
+
+            if docx_files:
+                self.folder_summary.set_text(
+                    f"Tim thay {len(docx_files)} file DOCX. PDF se duoc tao trong: {self.output_folder}"
+                )
+                self.convert_button.set_sensitive(not self.converting)
+                if not keep_status:
+                    self.set_status(f"San sang convert {len(docx_files)} file.")
+            else:
+                self.folder_summary.set_text(
+                    "Khong co file DOCX nao nam truc tiep trong thu muc nay."
+                )
+                self.convert_button.set_sensitive(False)
+                if not keep_status:
+                    self.set_status("Chua tim thay file DOCX.")
+
+            self.open_output_button.set_sensitive(
+                bool(self.output_folder and self.output_folder.is_dir())
+            )
+
+        def on_choose_folder_clicked(self, _button: Gtk.Button) -> None:
+            dialog = Gtk.FileChooserDialog(
+                title="Chon thu muc can convert",
+                parent=self,
+                action=Gtk.FileChooserAction.SELECT_FOLDER,
+            )
+            dialog.add_buttons(
+                Gtk.STOCK_CANCEL,
+                Gtk.ResponseType.CANCEL,
+                "Chon",
+                Gtk.ResponseType.OK,
+            )
+
+            if self.selected_folder is not None:
+                dialog.set_filename(str(self.selected_folder))
+
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                selected_path = dialog.get_filename()
+                if selected_path:
+                    self.set_selected_folder(Path(selected_path))
+
+            dialog.destroy()
+
+        def on_drag_motion(self, _widget, drag_context, _x, _y, time_) -> bool:
+            self.drop_zone.get_style_context().add_class("drag-hover")
+            drag_context.drag_status(Gdk.DragAction.COPY, time_)
+            return True
+
+        def on_drag_leave(self, _widget, _drag_context, _time_) -> None:
+            self.drop_zone.get_style_context().remove_class("drag-hover")
+
+        def on_drag_data_received(
+            self,
+            _widget,
+            drag_context,
+            _x,
+            _y,
+            data,
+            _info,
+            time_,
+        ) -> None:
+            self.drop_zone.get_style_context().remove_class("drag-hover")
+            folder = None
+            for uri in data.get_uris() or []:
+                path = uri_to_path(uri)
+                if path is None:
+                    continue
+                if path.is_dir():
+                    folder = path
+                    break
+                if path.is_file():
+                    folder = path.parent
+                    break
+
+            success = folder is not None
+            if success:
+                self.set_selected_folder(folder)
+            else:
+                self.append_log("Chi chap nhan thu muc local hoac file local.")
+                self.set_status("Drop khong hop le.")
+
+            Gtk.drag_finish(drag_context, success, False, time_)
+
+        def on_convert_clicked(self, _button: Gtk.Button) -> None:
+            if self.selected_folder is None or self.converting:
+                return
+
+            docx_files = find_docx_files(self.selected_folder)
+            if not docx_files:
+                self.append_log("Khong co file DOCX nao de convert.")
+                self.set_status("Khong co gi de convert.")
+                self._update_folder_ui()
+                return
+
+            self.converting = True
+            self.choose_button.set_sensitive(False)
+            self.convert_button.set_sensitive(False)
+            self.open_output_button.set_sensitive(False)
+            self.set_status(f"Dang convert {len(docx_files)} file...")
+            self.append_log(f"Bat dau convert {len(docx_files)} file trong {self.selected_folder}")
+
+            worker = threading.Thread(
+                target=self._convert_in_background,
+                args=(self.selected_folder,),
+                daemon=True,
+            )
+            worker.start()
+
+        def _convert_in_background(self, folder: Path) -> None:
+            result = convert_folder(folder)
+            GLib.idle_add(self._finish_conversion, result)
+
+        def _finish_conversion(self, result: dict) -> bool:
+            self.converting = False
+            self.choose_button.set_sensitive(True)
+            self.output_folder = result["output_dir"]
+
+            if result["stdout"].strip():
+                for line in result["stdout"].strip().splitlines():
+                    self.append_log(f"libreoffice: {line}")
+
+            if result["stderr"].strip():
+                for line in result["stderr"].strip().splitlines():
+                    self.append_log(f"stderr: {line}")
+
+            for created_file in result["created_files"]:
+                self.append_log(f"OK   {created_file.name}")
+
+            for missing_source in result["missing_sources"]:
+                self.append_log(f"FAIL {missing_source.name}")
+
+            total = len(result["source_files"])
+            success_count = len(result["created_files"])
+            if result["ok"]:
+                self.set_status(
+                    f"Da convert xong {success_count}/{total} file vao {result['output_dir']}"
+                )
+                self.append_log(f"Hoan tat. Output: {result['output_dir']}")
+            else:
+                error_message = result["error"] or "Convert chua hoan tat."
+                self.set_status(
+                    f"Co loi: {success_count}/{total} file thanh cong. Xem log de biet them."
+                )
+                self.append_log(error_message)
+
+            self._update_folder_ui(keep_status=True)
+            return False
+
+        def on_open_output_clicked(self, _button: Gtk.Button) -> None:
+            if not self.output_folder or not self.output_folder.is_dir():
+                self.append_log("Thu muc output chua ton tai.")
+                return
+
+            try:
+                subprocess.Popen(["xdg-open", str(self.output_folder)])
+            except FileNotFoundError:
+                self.append_log("Khong tim thay xdg-open de mo thu muc output.")
+
+    window = ConvertPdfWindow(initial_folder)
+    window.connect("destroy", Gtk.main_quit)
+    window.show_all()
+    Gtk.main()
+    return 0
+
+
+def print_help() -> None:
+    print(
+        f"""Sử dụng:
+  {APP_NAME} [THƯ_MỤC_HOẶC_FILE_DOCX...]
+  {APP_NAME} --batch THƯ_MỤC
+  {APP_NAME} --help
+
+Mô tả:
+  Convert toàn bộ file .docx nằm trực tiếp trong một thư mục sang PDF.
+  PDF sau convert được ghi vào thư mục {OUTPUT_DIR_NAME} ngay bên trong thư mục nguồn.
+
+Cách chạy:
+  Không truyền tham số:
+    Mở giao diện kéo thả/chọn thư mục. Nếu thư mục hiện tại có DOCX,
+    app sẽ tự chọn thư mục hiện tại.
+
+  Truyền thư mục hoặc file DOCX:
+    Mở giao diện và tự chọn sẵn thư mục đó. Nếu truyền file DOCX,
+    app sẽ dùng thư mục cha của file.
+
+  Dùng --batch:
+    Convert trực tiếp trên terminal, không mở giao diện.
+
+Ví dụ:
+  {APP_NAME}
+  {APP_NAME} /duong/dan/thu-muc-docx
+  {APP_NAME} /duong/dan/file.docx
+  {APP_NAME} --batch /duong/dan/thu-muc-docx
+
+Tùy chọn:
+  --batch THƯ_MỤC   Convert không mở giao diện.
+  -h, --help        Hiển thị hướng dẫn này.
+"""
+    )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        add_help=False,
+    )
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--batch",
+        metavar="FOLDER",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(argv[1:])
+
+    if args.help:
+        print_help()
+        return 0
+
+    if args.batch:
+        return run_batch(Path(args.batch).expanduser())
+
+    initial_folder = pick_initial_folder(args.paths)
+    return run_gui(initial_folder)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
